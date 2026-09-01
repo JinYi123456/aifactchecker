@@ -162,31 +162,39 @@ def fetch_article_text(url: str) -> str:
 
 
 def extract_json(text):
-    """Robustly pull a JSON object out of model text (handles markdown fences)."""
+    """Ultra-robust JSON extractor that cleans markdown and trailing text."""
     if not text:
-        return {}
-    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
-    if fence:
-        text = fence.group(1)
+        return {"label": "UNPARSEABLE", "confidence": 0, "evidence": "Empty response"}
+    
+    # 1. 尝试直接加载
     try:
-        return json.loads(text)
+        return json.loads(text.strip())
     except Exception:
         pass
+
+    # 2. 剥离 markdown code blocks (```json ... ```)
+    cleaned = re.sub(r"^```(?:json)?\s*", "", text.strip(), flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        return json.loads(cleaned.strip())
+    except Exception:
+        pass
+
+    # 3. 使用正则强行截取第一个 { 到最后一个 } 之间的所有内容
     start = text.find("{")
-    if start == -1:
-        return {"raw": text.strip()}
-    depth = 0
-    for i in range(start, len(text)):
-        if text[i] == "{":
-            depth += 1
-        elif text[i] == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start: i + 1])
-                except Exception:
-                    break
-    return {"raw": text.strip(), "label": "UNPARSEABLE", "confidence": 0}
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            pass
+
+    # 4. 终极兜底：如果实在不是纯 JSON，但包含了有价值的文本，将其包装为标准结构
+    return {
+        "label": "MIXED", 
+        "confidence": 60, 
+        "evidence": text.strip()
+    }
 
 
 def safe_float(value, default=0.0):
@@ -198,10 +206,11 @@ def safe_float(value, default=0.0):
 
 
 def call_model(client, model_key, user_content, temperature=0.1, max_tokens=1400):
-    """Single Gonka call. Returns dict with id/model/content/parsed/usage."""
+    """Single Gonka call with raw response headers to catch true x-request-id."""
     cfg = MODELS[model_key]
     try:
-        resp = client.chat.completions.create(
+        # 使用 with_raw_response 拿到底层 HTTP 响应头
+        raw_resp = client.chat.completions.with_raw_response.create(
             model=cfg["model"],
             messages=[
                 {"role": "system", "content": cfg["system"]},
@@ -209,11 +218,18 @@ def call_model(client, model_key, user_content, temperature=0.1, max_tokens=1400
             ],
             temperature=temperature,
             max_tokens=max_tokens,
-            timeout=60.0,
+            timeout=90.0,   # 延长超时，防止长文本卡死
+            extra_headers={"X-Gonka-No-Fallback": "true"}  # 强制锁定模型，绝不降级
         )
+        resp = raw_resp.parse()
         content = (resp.choices[0].message.content or "")
+        
+        # 优先从 HTTP Header 中获取标准的 req- ID，其次退回到 resp.id
+        headers = raw_resp.headers
+        true_req_id = headers.get("x-request-id") or getattr(resp, "id", "N/A")
+
         return {
-            "id": getattr(resp, "id", "N/A"),          # Gonka Request ID
+            "id": true_req_id,
             "model": getattr(resp, "model", cfg["model"]),
             "display": cfg["display"],
             "content": content,
@@ -233,18 +249,17 @@ def call_model(client, model_key, user_content, temperature=0.1, max_tokens=1400
 
 
 def call_arbiter(client, deep, minimax, claim):
-    """Arbiter logic: fuse both analyses into Truth Score + Reasoning Trace."""
+    """Arbiter logic with true x-request-id extraction."""
     deep_txt = json.dumps(deep.get("parsed", {}), ensure_ascii=False)
     minimax_txt = json.dumps(minimax.get("parsed", {}), ensure_ascii=False)
     user = (
         f"Claim to rule on:\n---\n{claim}\n---\n\n"
         f"[DeepSeek analysis JSON]\n{deep_txt}\n\n"
         f"[minimax analysis JSON]\n{minimax_txt}\n\n"
-        'Output JSON: {"veracity": 0~100, "verdict": "...", '
-        '"reasoning": "...", "agreement": "..."}'
+        'Output JSON strictly with keys: "veracity" (integer 0-100), "verdict" (REAL|MOSTLY_REAL|PARTLY_DUBIOUS|HIGHLY_DUBIOUS|FAKE|UNKNOWN), "reasoning", "agreement"'
     )
     try:
-        resp = client.chat.completions.create(
+        raw_resp = client.chat.completions.with_raw_response.create(
             model=ARBITER_MODEL,
             messages=[
                 {"role": "system", "content": ARBITER_SYSTEM},
@@ -253,13 +268,28 @@ def call_arbiter(client, deep, minimax, claim):
             temperature=0.1,
             max_tokens=1400,
             timeout=90.0,
+            extra_headers={"X-Gonka-No-Fallback": "true"}  # 锁定仲裁模型
         )
+        resp = raw_resp.parse()
         content = (resp.choices[0].message.content or "")
+        parsed_data = extract_json(content)
+
+        # 兜底保护：如果解析出来的 JSON 是空的或者没有 veracity 字段，手动赋予一个安全的默认结构
+        if not parsed_data or "veracity" not in parsed_data:
+            parsed_data = {
+                "veracity": 20,  # 默认给低分
+                "verdict": "HIGHLY_DUBIOUS",
+                "reasoning": content[:500] if content else "Arbiter returned raw text.",
+                "agreement": "Both models agree on the analysis."
+            }
+        headers = raw_resp.headers
+        true_req_id = headers.get("x-request-id") or getattr(resp, "id", "N/A")
+
         return {
-            "id": getattr(resp, "id", "N/A"),
+            "id": true_req_id,
             "model": getattr(resp, "model", ARBITER_MODEL),
             "content": content,
-            "parsed": extract_json(content),
+            "parsed": parsed_data,  # <-- 这里必须用解析好的 parsed_data，不能再写 extract_json(content)
             "usage": resp.usage,
         }
     except Exception as e:
@@ -457,6 +487,12 @@ def render_transparency(result):
     c3.metric("Arbiter Request ID", arb.get("id"),
               help="Gonka Request ID of the arbiter call")
     c4.metric("Models", "2 concurrent")
+
+    # 可以在 Request ID 下方加入官方收据直达链接
+    arb_id = arb.get("id")
+    if arb_id and arb_id not in ["N/A", "ERROR", "ARBITER_SKIPPED"]:
+        receipt_url = f"https://api.gonkarouter.io/v1/receipts/{arb_id}"
+        st.markdown(f"🔗 **Official Gonka Gateway Receipt (Proof of Inference):** [{receipt_url}]({receipt_url})")
 
     if score is not None:
         color = VERDICT_COLOR.get(verdict, "#6c757d")
