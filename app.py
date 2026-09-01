@@ -513,12 +513,14 @@ def main():
         st.header("Gonka connection")
         api_key = st.text_input(
             "API Key",
-            value=key_env,
+            value="",      # 默认空白，不显示你的 Key
             type="password",
-            help=f"Falls back to env var {DEFAULT_KEY_ENV}.",
+            placeholder="Enter your API Key",
+            #help=f"Falls back to env var {DEFAULT_KEY_ENV}.",
         )
-        if not api_key:
-            api_key = key_env
+        # 把这几行删掉，不要让它自动 fallback 到你的 key
+        #if not api_key:
+            #api_key = key_env
         base_url = st.text_input("Base URL", value=DEFAULT_BASE_URL)
         st.caption("OpenAI SDK · `response.id` 即 Gonka Request ID。")
         st.markdown("---")
